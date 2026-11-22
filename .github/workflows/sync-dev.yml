@@ -1,0 +1,69 @@
+name: Sync Upstream Dev
+
+on:
+  schedule:
+    # 08:17 Asia/Shanghai (UTC+8)
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      dev_sha: ${{ steps.merge.outputs.dev_sha }}
+
+    steps:
+      - name: Check out fork dev
+        uses: actions/checkout@v7
+        with:
+          ref: refs/heads/dev
+          fetch-depth: 0
+
+      - name: Merge updated upstream dev
+        id: merge
+        shell: bash
+        run: |
+          git -c http.https://github.com/.extraheader= fetch --no-tags https://github.com/Sesame-AG/Sesame-AG.git refs/heads/dev
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            printf 'Fork dev already includes upstream dev `%s`.\n' "$upstream_sha" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-commit --no-ff "$upstream_sha"; then
+            git rev-parse --verify --quiet MERGE_HEAD >/dev/null || exit 1
+          fi
+
+          # Keep this fork's workflow definitions, including when upstream adds new ones.
+          git restore --source=HEAD --staged --worktree -- .github/workflows/
+          if [[ -n "$(git ls-files --unmerged)" ]]; then
+            git diff --name-only --diff-filter=U
+            echo "::error::Resolve the remaining merge conflicts in fork dev to resume syncing."
+            exit 1
+          fi
+          git diff --cached --exit-code HEAD -- .github/workflows/
+          git commit -m "Merge upstream dev ${upstream_sha:0:12}"
+          git push origin HEAD:refs/heads/dev
+
+          dev_sha=$(git rev-parse HEAD)
+          printf 'dev_sha=%s\n' "$dev_sha" >> "$GITHUB_OUTPUT"
+          printf 'Synced upstream dev `%s` to fork dev `%s`.\n' "$upstream_sha" "$dev_sha" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.dev_sha != ''
+    uses: ./.github/workflows/android.yml
+    with:
+      dev_sha: ${{ needs.sync.outputs.dev_sha }}
